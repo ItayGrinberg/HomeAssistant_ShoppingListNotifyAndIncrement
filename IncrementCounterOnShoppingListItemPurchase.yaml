@@ -1,0 +1,249 @@
+blueprint:
+  name: Increment Counter on Shopping List Item Purchase
+  description: |
+    This automation blueprint monitors a shopping list entity for the purchase of a specific item.
+    When the item is marked as purchased, it prompts the user to enter how many items they bought
+    using a mobile notification. The automation then increments a counter with the entered value.
+  domain: automation
+  input:
+    counter_target:
+      name: Counter to Increment
+      description: Select the counter to increment.
+      selector:
+        entity:
+          domain: counter
+    current_state_boolean:
+      name: Current Item State
+      description: Helper to store current item state.
+      selector:
+        entity:
+          domain: input_boolean
+    purchased_item:
+      name: Purchased Item
+      description: The shopping list item that was purchased.
+      selector:
+        text:
+          multiline: false
+          multiple: false
+    shopping_list_entity:
+      name: Shopping List Entity
+      description: Select your shopping list entity (must be a todo entity).
+      selector:
+        entity:
+          domain:
+            - todo
+          multiple: false
+    timeout_hours:
+      name: Timeout Duration (hours)
+      description: How many hours to wait for a user response before dismissing the notification.
+      default: 1
+      selector:
+        number:
+          min: 0.25
+          max: 24
+          step: 0.25
+          mode: slider
+    number_1:
+      name: Amount 1
+      description: The first amount to display as an option to add to current stock.
+      default: ""
+      selector:
+        text:
+    number_2:
+      name: Amount 2
+      description: The second amount to display as an option to add to current stock.
+      default: ""
+      selector:
+        text:
+    notify_target:
+      name: Mobile Device to Notify
+      description: The mobile device to send the notification to.
+      selector:
+        device:
+          integration: mobile_app
+    delay_before_notify:
+      name: Delay Before Notification (minutes)
+      description: How long to wait (in minutes) before sending the notification to your phone.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          mode: slider
+
+mode: parallel
+
+variables:
+  notify_target: !input notify_target
+  counter_target: !input counter_target
+  purchased_item: !input purchased_item
+  shopping_list: !input shopping_list_entity
+  current_state: !input current_state_boolean
+  delay_before_notify: !input delay_before_notify
+
+  timeout_hours: !input timeout_hours
+
+  raw_number_1: !input number_1
+  raw_number_2: !input number_2
+
+  number_1: >-
+    {% set n = raw_number_1 | trim %}
+    {% if n | regex_match('^\\d+$') %}
+      {{ n }}
+    {% else %}
+      ''
+    {% endif %}
+  number_2: >-
+    {% set n = raw_number_2 | trim %}
+    {% if n | regex_match('^\\d+$') %}
+      {{ n }}
+    {% else %}
+      ''
+    {% endif %}
+
+triggers:
+  - trigger: state
+    entity_id:
+      - !input shopping_list_entity
+
+actions:
+  - target:
+      entity_id: "{{ shopping_list }}"
+    response_variable: shopping_list_items
+    action: todo.get_items
+    data:
+      status:
+        - needs_action
+  - variables:
+      item_in_list: >
+        {{ purchased_item in shopping_list_items[shopping_list]['items'] | map(attribute='summary') | list }}
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ item_in_list and is_state(current_state, 'off') }}"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ current_state }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ is_state(current_state, 'on') and not item_in_list }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ current_state }}"
+          - alias: Optional delay before sending notification
+            delay:
+              minutes: "{{ delay_before_notify }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ number_1 == '' }}"
+                sequence:
+                  - service: notify.mobile_app_{{ notify_target | device_attr('name') | lower | replace(' ', '_') }}
+                    data:
+                      message: "How many {{ purchased_item }} have you bought?"
+                      data:
+                        actions:
+                          - action: REPLY
+                            title: "Other"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ number_2 == '' and number_1 != '' }}"
+                sequence:
+                  - service: notify.mobile_app_{{ notify_target | device_attr('name') | lower | replace(' ', '_') }}
+                    data:
+                      message: "How many {{ purchased_item }} have you bought?"
+                      data:
+                        actions:
+                          - action: select_number_1
+                            title: "+ {{ number_1 }}"
+                          - action: REPLY
+                            title: "Other"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ number_1 != '' and number_2 != '' }}"
+                sequence:
+                  - service: notify.mobile_app_{{ notify_target | device_attr('name') | lower | replace(' ', '_') }}
+                    data:
+                      message: "How many {{ purchased_item }} have you bought?"
+                      data:
+                        tag: number_input_prompt
+                        actions:
+                          - action: select_number_1
+                            title: "+ {{ number_1 }}"
+                          - action: select_number_2
+                            title: "+ {{ number_2 }}"
+                          - action: REPLY
+                            title: "Other"
+            default: []
+          - alias: Wait for user response
+            wait_for_trigger:
+              - event_type: mobile_app_notification_action
+                event_data:
+                  action: REPLY
+                  tag: number_input_prompt
+                trigger: event
+              - event_type: mobile_app_notification_action
+                event_data:
+                  action: select_number_1
+                  tag: number_input_prompt
+                trigger: event
+              - event_type: mobile_app_notification_action
+                event_data:
+                  action: select_number_2
+                  tag: number_input_prompt
+                trigger: event
+            timeout:
+              hours: "{{ timeout_hours }}"
+            continue_on_timeout: true
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ wait.trigger is none }}"
+                sequence:
+                  - service: notify.mobile_app_{{ notify_target | device_attr('name') | lower | replace(' ', '_') }}
+                    data:
+                      message: clear_notification
+                      data:
+                        tag: number_input_prompt
+            default:
+              - variables:
+                  selected_action: "{{ wait.trigger.event.data.action }}"
+                  selected_number: >-
+                    {% if selected_action == "select_number_1" %}
+                      {{ number_1 }}
+                    {% elif selected_action == "select_number_2" %}
+                      {{ number_2 }}
+                    {% elif wait.trigger.event.data.reply_text | regex_match('^\\d+$') %}
+                      {{ wait.trigger.event.data.reply_text }}
+                    {% else %}
+                      ''
+                    {% endif %}
+
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ selected_number != '' }}"
+                    sequence:
+                      - variables:
+                          new_value: >-
+                            {{ states(counter_target) | int(0) + (selected_number | int(0)) }}
+                      - service: counter.set_value
+                        target:
+                          entity_id: !input counter_target
+                        data:
+                          value: "{{ new_value }}"
+
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wait.trigger.event.data.action == 'REPLY' }}"
+                    sequence:
+                      - service: notify.mobile_app_{{ notify_target | device_attr('name') | lower | replace(' ', '_') }}
+                        data:
+                          message: clear_notification
+                          data:
+                            tag: number_input_prompt
